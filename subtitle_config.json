@@ -1,0 +1,42 @@
+{
+    "_comment": "字幕配置文件 - 用于视频字幕生成",
+    
+    "font": {
+        "name": "微软雅黑",
+        "size": 13,
+        "_comment": "字体配置：name=字体名称，size=字体大小"
+    },
+    
+    "style": {
+        "primary_color": "&Hffffff",
+        "outline_color": "&H000000",
+        "outline": 1,
+        "shadow": 1,
+        "alignment": 2,
+        "margin_v": 40,
+        "_comment": "样式配置：primary_color=字体颜色(白色)，outline_color=描边颜色(黑色)，outline=描边宽度，shadow=阴影，alignment=对齐方式(2=底部居中)，margin_v=底部边距"
+    },
+    
+    "merge": {
+        "min_duration": 0.5,
+        "max_len_ratio": 1.0,
+        "_comment": "合并配置：min_duration=最小持续时间阈值(秒)，低于此值会尝试与下一行合并"
+    },
+    
+    "layout": {
+        "margin": 60,
+        "outline_extra": 12,
+        "_comment": "布局配置：margin=左右边距，outline_extra=字符宽度额外计算值"
+    },
+    
+    "max_chars": {
+        "vertical": 12,
+        "horizontal": 20,
+        "_comment": "每行最大字符数：vertical=竖屏最大字符数，horizontal=横屏最大字符数"
+    },
+    
+    "batch": {
+        "max_workers": 4,
+        "_comment": "批量处理配置：max_workers=并行处理线程数，不建议超过4"
+    }
+}
