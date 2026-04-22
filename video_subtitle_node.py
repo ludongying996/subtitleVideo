@@ -32,6 +32,24 @@ except ImportError:
     REQUESTS_AVAILABLE = False
     print("[VideoSubtitleNode] 警告: requests库未安装，VideoSubtitleNode(URL)节点将不可用")
 
+try:
+    from qcloud_cos import CosConfig
+    from qcloud_cos import CosS3Client
+    COS_SDK_AVAILABLE = True
+except ImportError:
+    COS_SDK_AVAILABLE = False
+    print("[VideoSubtitleNode] cos-python-sdk-v5未安装，尝试自动安装...")
+    try:
+        import subprocess
+        subprocess.run([sys.executable, "-m", "pip", "install", "cos-python-sdk-v5", "-q"], check=True)
+        from qcloud_cos import CosConfig
+        from qcloud_cos import CosS3Client
+        COS_SDK_AVAILABLE = True
+        print("[VideoSubtitleNode] cos-python-sdk-v5安装成功")
+    except Exception as e:
+        print(f"[VideoSubtitleNode] cos-python-sdk-v5安装失败: {e}")
+        print("[VideoSubtitleNode] 警告: OSS上传功能将不可用，请手动运行: pip install cos-python-sdk-v5")
+
 FFMPEG_PATH = None
 FFPROBE_PATH = None
 
@@ -47,6 +65,7 @@ def find_ffmpeg():
     
     if is_windows:
         local_ffmpeg_paths = [
+            os.path.join(current_dir, "ffmpeg-master-latest-win64-gpl", "bin", "ffmpeg.exe"),
             os.path.join(current_dir, "ffmpeg-master-latest-win64-gpl-shared", "bin", "ffmpeg.exe"),
             os.path.join(current_dir, "ffmpeg", "bin", "ffmpeg.exe"),
             os.path.join(current_dir, "ffmpeg", "ffmpeg.exe"),
@@ -55,6 +74,7 @@ def find_ffmpeg():
         ]
         
         local_ffprobe_paths = [
+            os.path.join(current_dir, "ffmpeg-master-latest-win64-gpl", "bin", "ffprobe.exe"),
             os.path.join(current_dir, "ffmpeg-master-latest-win64-gpl-shared", "bin", "ffprobe.exe"),
             os.path.join(current_dir, "ffmpeg", "bin", "ffprobe.exe"),
             os.path.join(current_dir, "ffmpeg", "ffprobe.exe"),
@@ -165,11 +185,50 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "comfyui_o
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def tensor_to_video(tensor, output_path, fps=30, use_gpu=False):
+def upload_to_cos(local_file_path, secret_id, secret_key, bucket, region, upload_path):
+    if not COS_SDK_AVAILABLE:
+        print("[VideoSubtitleNode] 错误: cos-python-sdk-v5库未安装，无法上传OSS")
+        return None
+    
+    try:
+        config = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key)
+        client = CosS3Client(config)
+        
+        file_name = os.path.basename(local_file_path)
+        cos_path = os.path.join(upload_path, file_name).replace("\\", "/")
+        
+        print(f"[VideoSubtitleNode] 上传文件到OSS: {cos_path}")
+        
+        with open(local_file_path, 'rb') as fp:
+            response = client.put_object(
+                Bucket=bucket,
+                Body=fp,
+                Key=cos_path
+            )
+        
+        if response and 'ETag' in response:
+            url = f"https://{bucket}.cos.{region}.myqcloud.com/{cos_path}"
+            print(f"[VideoSubtitleNode] OSS上传成功: {url}")
+            return url
+        else:
+            print(f"[VideoSubtitleNode] OSS上传失败: {response}")
+            return None
+            
+    except Exception as e:
+        print(f"[VideoSubtitleNode] OSS上传异常: {str(e)}")
+        return None
+
+
+def tensor_to_video(tensor, output_path, fps=30, use_gpu=False, audio_path=None):
     if not NUMPY_AVAILABLE or not PIL_AVAILABLE:
         raise ImportError("numpy和PIL库未安装")
     
+    if FFMPEG_PATH is None:
+        print(f"[VideoSubtitleFromImages] 错误: FFmpeg未找到，请检查FFmpeg是否安装")
+        return None
+    
     print(f"[VideoSubtitleFromImages] 保存视频: {output_path}")
+    print(f"[VideoSubtitleFromImages] FFmpeg路径: {FFMPEG_PATH}")
     
     num_frames = tensor.shape[0]
     height = tensor.shape[1]
@@ -193,35 +252,78 @@ def tensor_to_video(tensor, output_path, fps=30, use_gpu=False):
         frame_pattern = os.path.join(temp_dir, "frame_%06d.png")
         
         if use_gpu and check_nvidia_gpu():
-            cmd = [
-                FFMPEG_PATH,
-                "-y",
-                "-framerate", str(fps),
-                "-i", frame_pattern,
-                "-c:v", "h264_nvenc",
-                "-preset", "p4",
-                "-cq", "23",
-                "-pix_fmt", "yuv420p",
-                output_path
-            ]
+            if audio_path and os.path.exists(audio_path):
+                cmd = [
+                    FFMPEG_PATH,
+                    "-y",
+                    "-framerate", str(fps),
+                    "-i", frame_pattern,
+                    "-i", audio_path,
+                    "-c:v", "h264_nvenc",
+                    "-preset", "p4",
+                    "-cq", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-shortest",
+                    output_path
+                ]
+            else:
+                cmd = [
+                    FFMPEG_PATH,
+                    "-y",
+                    "-framerate", str(fps),
+                    "-i", frame_pattern,
+                    "-c:v", "h264_nvenc",
+                    "-preset", "p4",
+                    "-cq", "23",
+                    "-pix_fmt", "yuv420p",
+                    output_path
+                ]
         else:
-            cmd = [
-                FFMPEG_PATH,
-                "-y",
-                "-framerate", str(fps),
-                "-i", frame_pattern,
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                output_path
-            ]
+            if audio_path and os.path.exists(audio_path):
+                cmd = [
+                    FFMPEG_PATH,
+                    "-y",
+                    "-framerate", str(fps),
+                    "-i", frame_pattern,
+                    "-i", audio_path,
+                    "-c:v", "libx264",
+                    "-preset", "medium",
+                    "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-shortest",
+                    output_path
+                ]
+            else:
+                cmd = [
+                    FFMPEG_PATH,
+                    "-y",
+                    "-framerate", str(fps),
+                    "-i", frame_pattern,
+                    "-c:v", "libx264",
+                    "-preset", "medium",
+                    "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    output_path
+                ]
         
         print(f"[VideoSubtitleFromImages] 编码视频...")
+        print(f"[VideoSubtitleFromImages] 命令: {' '.join(cmd)}")
+        print(f"[VideoSubtitleFromImages] 帧目录: {temp_dir}")
+        print(f"[VideoSubtitleFromImages] 帧文件数: {len([f for f in os.listdir(temp_dir) if f.endswith('.png')])}")
+        
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
-            print(f"[VideoSubtitleFromImages] 视频编码失败: {result.stderr}")
+            print(f"[VideoSubtitleFromImages] 视频编码失败!")
+            print(f"[VideoSubtitleFromImages] 返回码: {result.returncode}")
+            if result.stdout:
+                print(f"[VideoSubtitleFromImages] stdout: {result.stdout[:2000]}")
+            if result.stderr:
+                print(f"[VideoSubtitleFromImages] stderr: {result.stderr[:2000]}")
             return None
         
         if os.path.exists(output_path):
@@ -732,23 +834,32 @@ class VideoSubtitleNode:
                 "底部边距": ("INT", {"default": 40, "min": 0, "max": 200}),
                 "竖屏每行最大字符数": ("INT", {"default": 12, "min": 5, "max": 50}),
                 "横屏每行最大字符数": ("INT", {"default": 20, "min": 5, "max": 100}),
+                "是否上传OSS": ("BOOLEAN", {"default": False}),
+                "腾讯云SecretId": ("STRING", {"default": ""}),
+                "腾讯云SecretKey": ("STRING", {"default": ""}),
+                "COS存储桶名称": ("STRING", {"default": ""}),
+                "COS区域": ("STRING", {"default": ""}),
+                "OSS上传路径": ("STRING", {"default": ""}),
             }
         }
     
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("images",)
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "oss_url")
     FUNCTION = "process"
     CATEGORY = "video"
     
     def process(self, video_url, subtitle_text, use_gpu=True,
                 字体名称="微软雅黑", 字体大小=13, 描边宽度=1, 阴影宽度=1, 底部边距=40,
-                竖屏每行最大字符数=12, 横屏每行最大字符数=20):
+                竖屏每行最大字符数=12, 横屏每行最大字符数=20,
+                是否上传OSS=False, 腾讯云SecretId="", 腾讯云SecretKey="", 
+                COS存储桶名称="", COS区域="", OSS上传路径=""):
         print(f"\n{'='*60}")
         print(f"[VideoSubtitleNode] 开始处理")
         print(f"  字体: {字体名称}, 大小: {字体大小}")
         print(f"  描边: {描边宽度}, 阴影: {阴影宽度}, 底部边距: {底部边距}")
         print(f"  竖屏最大字符: {竖屏每行最大字符数}, 横屏最大字符: {横屏每行最大字符数}")
         print(f"  GPU加速: {'开启' if use_gpu else '关闭'}")
+        print(f"  上传OSS: {'开启' if 是否上传OSS else '关闭'}")
         print(f"{'='*60}")
         
         if not video_url:
@@ -780,6 +891,8 @@ class VideoSubtitleNode:
         output_video = os.path.join(OUTPUT_DIR, f"output_{timestamp}.mp4")
         frames_dir = os.path.join(OUTPUT_DIR, f"frames_{timestamp}")
         
+        oss_url = ""
+        
         try:
             download_video(video_url, temp_video)
             
@@ -799,6 +912,16 @@ class VideoSubtitleNode:
                 print(f"  文件大小: {file_size_mb:.2f} MB")
                 print(f"  处理耗时: {elapsed_time:.2f} 秒")
                 
+                if 是否上传OSS:
+                    oss_url = upload_to_cos(
+                        result, 
+                        腾讯云SecretId, 
+                        腾讯云SecretKey, 
+                        COS存储桶名称, 
+                        COS区域, 
+                        OSS上传路径
+                    ) or ""
+                
                 frames = video_to_frames(result, frames_dir)
                 
                 if frames:
@@ -816,10 +939,10 @@ class VideoSubtitleNode:
                         os.remove(output_video)
                     
                     print(f"[VideoSubtitleNode] 返回图像tensor: {tensor.shape}")
-                    return (tensor,)
+                    return (tensor, oss_url)
                 
             print("[VideoSubtitleNode] 处理失败")
-            return (torch.zeros(1, 64, 64, 3),)
+            return (torch.zeros(1, 64, 64, 3), "")
                 
         except Exception as e:
             font_size = old_font_size
@@ -830,7 +953,7 @@ class VideoSubtitleNode:
             print(f"[VideoSubtitleNode] 处理异常: {str(e)}")
             if os.path.exists(temp_video):
                 os.remove(temp_video)
-            return (torch.zeros(1, 64, 64, 3),)
+            return (torch.zeros(1, 64, 64, 3), "")
 
 
 class VideoSubtitleFromImages:
@@ -843,6 +966,8 @@ class VideoSubtitleFromImages:
                 "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0}),
             },
             "optional": {
+                "audio": ("AUDIO",),
+                "audio_path": ("STRING", {"default": ""}),
                 "use_gpu": ("BOOLEAN", {"default": False}),
                 "字体名称": ("STRING", {"default": "微软雅黑"}),
                 "字体大小": ("INT", {"default": 13, "min": 8, "max": 100}),
@@ -851,28 +976,39 @@ class VideoSubtitleFromImages:
                 "底部边距": ("INT", {"default": 40, "min": 0, "max": 200}),
                 "竖屏每行最大字符数": ("INT", {"default": 12, "min": 5, "max": 50}),
                 "横屏每行最大字符数": ("INT", {"default": 20, "min": 5, "max": 100}),
+                "是否上传OSS": ("BOOLEAN", {"default": False}),
+                "腾讯云SecretId": ("STRING", {"default": ""}),
+                "腾讯云SecretKey": ("STRING", {"default": ""}),
+                "COS存储桶名称": ("STRING", {"default": ""}),
+                "COS区域": ("STRING", {"default": ""}),
+                "OSS上传路径": ("STRING", {"default": ""}),
             }
         }
     
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("images",)
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "oss_url")
     FUNCTION = "process"
     CATEGORY = "video"
     
-    def process(self, images, subtitle_text, fps, use_gpu=False,
+    def process(self, images, subtitle_text, fps, audio=None, audio_path="", use_gpu=False,
                 字体名称="微软雅黑", 字体大小=13, 描边宽度=1, 阴影宽度=1, 底部边距=40,
-                竖屏每行最大字符数=12, 横屏每行最大字符数=20):
+                竖屏每行最大字符数=12, 横屏每行最大字符数=20,
+                是否上传OSS=False, 腾讯云SecretId="", 腾讯云SecretKey="", 
+                COS存储桶名称="", COS区域="", OSS上传路径=""):
         print(f"\n{'='*60}")
         print(f"[VideoSubtitleFromImages] 开始处理 (FFmpeg drawtext模式)")
         print(f"  字体: {字体名称}, 大小: {字体大小}")
         print(f"  描边: {描边宽度}, 阴影: {阴影宽度}, 底部边距: {底部边距}")
         print(f"  竖屏最大字符: {竖屏每行最大字符数}, 横屏最大字符: {横屏每行最大字符数}")
         print(f"  GPU加速: {'开启' if use_gpu else '关闭'}")
+        print(f"  上传OSS: {'开启' if 是否上传OSS else '关闭'}")
+        print(f"  音频输入: {'有' if audio else '无'}")
+        print(f"  音频路径: {audio_path if audio_path else '无'}")
         print(f"{'='*60}")
         
         if not subtitle_text:
             print("[VideoSubtitleFromImages] 字幕文本为空，返回原图")
-            return (images,)
+            return (images, "")
         
         start_time = time.time()
         
@@ -882,12 +1018,49 @@ class VideoSubtitleFromImages:
         subtitle_video = os.path.join(output_dir, f"subtitle_{timestamp}.mp4")
         frames_dir = os.path.join(output_dir, f"frames_{timestamp}")
         
+        local_audio_path = None
+        
+        if audio is not None:
+            print(f"[VideoSubtitleFromImages] 处理AUDIO输入...")
+            try:
+                import torchaudio
+                waveform = audio.get("waveform")
+                sample_rate = audio.get("sample_rate", 44100)
+                
+                if waveform is not None:
+                    audio_temp = os.path.join(output_dir, f"audio_{timestamp}.wav")
+                    if waveform.dim() == 3:
+                        waveform = waveform.squeeze(0)
+                    torchaudio.save(audio_temp, waveform.cpu(), sample_rate)
+                    local_audio_path = audio_temp
+                    print(f"[VideoSubtitleFromImages] 音频保存完成: {audio_temp}")
+            except Exception as e:
+                print(f"[VideoSubtitleFromImages] 音频处理失败: {e}")
+        
+        if audio_path and not local_audio_path:
+            if audio_path.startswith("http://") or audio_path.startswith("https://"):
+                print(f"[VideoSubtitleFromImages] 下载音频文件: {audio_path}")
+                audio_temp = os.path.join(output_dir, f"audio_{timestamp}.mp3")
+                try:
+                    import requests
+                    response = requests.get(audio_path, timeout=60)
+                    with open(audio_temp, 'wb') as f:
+                        f.write(response.content)
+                    local_audio_path = audio_temp
+                    print(f"[VideoSubtitleFromImages] 音频下载完成: {audio_temp}")
+                except Exception as e:
+                    print(f"[VideoSubtitleFromImages] 音频下载失败: {e}")
+            elif os.path.exists(audio_path):
+                local_audio_path = audio_path
+        
+        oss_url = ""
+        
         print(f"[VideoSubtitleFromImages] 步骤1: 将图像帧转为临时视频...")
-        temp_result = tensor_to_video(images, temp_video, fps, use_gpu)
+        temp_result = tensor_to_video(images, temp_video, fps, use_gpu, local_audio_path)
         
         if not temp_result or not os.path.exists(temp_video):
             print(f"[VideoSubtitleFromImages] 临时视频创建失败")
-            return (images,)
+            return (images, "")
         
         print(f"[VideoSubtitleFromImages] 步骤2: 使用FFmpeg drawtext渲染字幕...")
         
@@ -916,7 +1089,20 @@ class VideoSubtitleFromImages:
             if os.path.exists(temp_video):
                 os.remove(temp_video)
             
+            if local_audio_path and os.path.exists(local_audio_path):
+                os.remove(local_audio_path)
+            
             if result and os.path.exists(result):
+                if 是否上传OSS:
+                    oss_url = upload_to_cos(
+                        result, 
+                        腾讯云SecretId, 
+                        腾讯云SecretKey, 
+                        COS存储桶名称, 
+                        COS区域, 
+                        OSS上传路径
+                    ) or ""
+                
                 print(f"[VideoSubtitleFromImages] 步骤3: 从视频提取帧...")
                 frames = video_to_frames(result, frames_dir)
                 
@@ -936,13 +1122,13 @@ class VideoSubtitleFromImages:
                     print(f"\n[VideoSubtitleFromImages] 处理完成!")
                     print(f"  输出形状: {tensor.shape}")
                     print(f"  处理耗时: {elapsed_time:.2f} 秒")
-                    return (tensor,)
+                    return (tensor, oss_url)
                 else:
                     print(f"[VideoSubtitleFromImages] 帧提取失败")
-                    return (images,)
+                    return (images, "")
             else:
                 print(f"[VideoSubtitleFromImages] FFmpeg处理失败")
-                return (images,)
+                return (images, "")
                 
         except Exception as e:
             font_size = old_font_size
@@ -958,17 +1144,19 @@ class VideoSubtitleFromImages:
                 os.remove(temp_video)
             if os.path.exists(subtitle_video):
                 os.remove(subtitle_video)
-            return (images,)
+            if local_audio_path and os.path.exists(local_audio_path):
+                os.remove(local_audio_path)
+            return (images, "")
 
 
 NODE_CLASS_MAPPINGS = {
     "VideoSubtitleNode": VideoSubtitleNode,
-    "VideoSubtitleFromImages": VideoSubtitleFromImages,
+    "VideoSubtitleFromImagesV2": VideoSubtitleFromImages,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoSubtitleNode": "Video Subtitle (OSS URL)",
-    "VideoSubtitleFromImages": "Video Subtitle (From Images)",
+    "VideoSubtitleFromImagesV2": "Video Subtitle (From Images) V2",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
